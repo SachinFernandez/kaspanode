@@ -183,7 +183,7 @@ app.get("/transactions/:address", async (req, res) => {
   const { address } = req.params;
   try {
     // This endpoint may differ depending on API version.
-    const resp = await axios.get(`${KASPA_REST}/addresses/${address}/transactions`);
+    const resp = await axios.get(`${KASPA_REST}/addresses/${address}/full-transactions`);
     res.json({
       status: "OK",
       transactions: resp.data
