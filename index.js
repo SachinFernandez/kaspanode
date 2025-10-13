@@ -257,12 +257,57 @@ app.post('/createTransaction', async (req, res) => {
 // ===== Transactions by Address (History) =====
 app.get("/transactions/:address", async (req, res) => {
   const { address } = req.params;
+  
   try {
-    // This endpoint may differ depending on API version.
+    // Fetch full transactions for the given address
     const resp = await axios.get(`${KASPA_REST}/addresses/${address}/full-transactions`);
+
+    // If no transactions found or invalid structure, return error
+    if (!resp.data || resp.data.length === 0) {
+      return res.status(404).json({
+        status: "ERROR",
+        error: "No transactions found for the address"
+      });
+    }
+
+    // Process the transactions to check for self-transfers
+    const transactions = resp.data.map(tx => {
+      let isSelfTransfer = false;
+      let isSent = false;
+      let isReceived = false;
+
+      // Extract the address from the inputs and outputs
+      const inputAddresses = tx.inputs.map(input => input.previous_outpoint_address).filter(address => address !== null);
+      const outputAddresses = tx.outputs.map(output => output.script_public_key_address);
+
+      // Check if the given address is in inputs (sent)
+      if (inputAddresses.includes(address)) {
+        isSent = true;
+      }
+
+      // Check if the given address is in outputs (received)
+      if (outputAddresses.includes(address)) {
+        isReceived = true;
+      }
+
+      // Check if the address appears both in inputs and outputs (self-transfer)
+      if (inputAddresses.includes(address) && outputAddresses.includes(address)) {
+        isSelfTransfer = true;
+      }
+
+      // Add flags to the transaction
+      return {
+        ...tx,
+        isSent,
+        isReceived,
+        isSelfTransfer
+      };
+    });
+
+    // Respond with the transactions and their statuses
     res.json({
       status: "OK",
-      transactions: resp.data
+      transactions
     });
   } catch (err) {
     console.error("Transaction fetch failed:", err.response?.data || err.message);
@@ -272,7 +317,6 @@ app.get("/transactions/:address", async (req, res) => {
     });
   }
 });
-
 // ===== Submit Transaction =====
 app.post("/submit", async (req, res) => {
   try {
