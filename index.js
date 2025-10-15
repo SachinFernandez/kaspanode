@@ -75,9 +75,8 @@ app.get("/utxos/:address", async (req, res) => {
 });
 
 app.post('/createTransaction', async (req, res) => {
-    try {
-      const { senderAddress, recipientAddress, amount, fee, privateKey } =
-        req.body;
+  try {
+    const { senderAddress, recipientAddress, amount, fee, privateKey } = req.body;
 
       // 1. Validate required parameters
       if (
@@ -118,141 +117,138 @@ app.post('/createTransaction', async (req, res) => {
         return res.status(400).json({ error: "Fee cannot be negative" });
       }
 
-      const sk = new PrivateKey(privateKey);
+    const amountToSend = BigInt(Math.floor(amount * 1e8));
+    const feeAmount = BigInt(Math.floor(fee * 1e8));
+    const totalNeeded = amountToSend + feeAmount;
 
-      // Fetch UTXOs
-      const { data: utxos } = await axios.get(
-        `https://api.kaspa.org/addresses/${senderAddress}/utxos`
-      );
+    const sk = new PrivateKey(privateKey);
 
-      let selectedUtxo = utxos.find((u) => u.utxoEntry.amount >= 100000);
-      if (!selectedUtxo)
-        return res.status(400).json({ error: "No suitable UTXO available" });
+    // Fetch UTXOs
+    const { data: utxos } = await axios.get(
+      `https://api.kaspa.org/addresses/${senderAddress}/utxos`
+    );
 
-      // Create transaction
-      const tx = new Transaction();
-      tx.setVersion(0);
+    // Select multiple UTXOs to cover totalNeeded
+    let inputs = [];
+    let inputSum = BigInt(0);
+    for (const u of utxos) {
+      inputs.push(u);
+      inputSum += BigInt(u.utxoEntry.amount);
+      if (inputSum >= totalNeeded) break;
+    }
+    if (inputSum < totalNeeded) {
+      return res.status(400).json({ error: "Insufficient UTXOs for requested amount" });
+    }
 
-      const txInput = new Transaction.Input.PublicKey({
-        prevTxId: selectedUtxo.outpoint.transactionId,
-        outputIndex: selectedUtxo.outpoint.index,
-        script: selectedUtxo.utxoEntry.scriptPublicKey.scriptPublicKey,
+    // Construct transaction
+    const tx = new Transaction();
+    tx.setVersion(0);
+
+    // Add all selected UTXOs as inputs
+    inputs.forEach(u => {
+      tx.addInput(new Transaction.Input.PublicKey({
+        prevTxId: u.outpoint.transactionId,
+        outputIndex: u.outpoint.index,
+        script: u.utxoEntry.scriptPublicKey.scriptPublicKey,
         sequenceNumber: 0,
         output: new Transaction.Output({
-          script: selectedUtxo.utxoEntry.scriptPublicKey.scriptPublicKey,
-          satoshis: Number(selectedUtxo.utxoEntry.amount),
+          script: u.utxoEntry.scriptPublicKey.scriptPublicKey,
+          satoshis: Number(u.utxoEntry.amount),
         }),
-      });
+      }));
+    });
 
-      const amountToSend = BigInt(Math.floor(amount * 1e8));
-      const feeAmount = BigInt(Math.floor(fee * 1e8));
-      const changeAmount = BigInt(selectedUtxo.utxoEntry.amount) - amountToSend - feeAmount;
+    // Calculate change
+    const changeAmount = inputSum - totalNeeded;
 
-      console.log("UTXO amount (sompi):", selectedUtxo.utxoEntry.amount);
-    console.log("AmountToSend:", amountToSend.toString());
-    console.log("FeeAmount:", feeAmount.toString());
-    console.log("ChangeAmount:", changeAmount.toString());
-       
-      const txOutput = new Transaction.Output({
-            script: new Script(new Address(recipientAddress)).toBuffer().toString('hex'),
-            satoshis: Number(amountToSend)
-      });
+    // Recipient output
+    tx.addOutput(new Transaction.Output({
+      script: new Script(new Address(recipientAddress)).toBuffer().toString('hex'),
+      satoshis: Number(amountToSend)
+    }));
 
-      const txChange = new Transaction.Output({
-        script: new Script(new Address(senderAddress))
-          .toBuffer()
-          .toString("hex"),
+    // Add change output only if above safe minimum (Kaspa recommends >0.02 KAS)
+    if (changeAmount >= BigInt(Math.floor(0.02 * 1e8))) {
+      tx.addOutput(new Transaction.Output({
+        script: new Script(new Address(senderAddress)).toBuffer().toString("hex"),
         satoshis: Number(changeAmount),
-      });
-
-      tx.addInput(txInput);
-      tx.addOutput(txOutput);
-      tx.addOutput(txChange);
-
-      // Sign input
-      const signedInputs = tx.inputs.map((input, index) => {
-        const inputSignature = input.getSignatures(
-          tx,
-          sk,
-          0,
-          crypto.Signature.SIGHASH_ALL,
-          null,
-          "schnorr"
-        )[0];
-        const signature = inputSignature.signature
-          .toBuffer("schnorr")
-          .toString("hex");
-
-        return {
-          previousOutpoint: {
-            transactionId: input.prevTxId.toString("hex"),
-            index: input.outputIndex,
-          },
-          signatureScript: `41${signature}01`,
-          sequence: input.sequenceNumber,
-          sigOpCount: 1,
-        };
-      });
-
-      // Construct REST JSON
-      const restApiJson = {
-        transaction: {
-          version: tx.version,
-          inputs: signedInputs,
-          outputs: [
-            {
-              amount: Number(amountToSend),
-              scriptPublicKey: {
-                version: 0,
-                scriptPublicKey: txOutput.script.toBuffer().toString("hex"),
-              },
-            },
-            {
-              amount: Number(changeAmount),
-              scriptPublicKey: {
-                version: 0,
-                scriptPublicKey: txChange.script.toBuffer().toString("hex"),
-              },
-            },
-          ],
-          lockTime: 0,
-          subnetworkId: "0000000000000000000000000000000000000000",
-        },
-        allowOrphan: true,
-      };
-
-      // Broadcast
-      const { data: txResponse } = await axios.post(
-        "https://api.kaspa.org/transactions",
-        restApiJson
-      );
-
-      // 9. Fetch balance for sender
-      let balanceResp;
-      try {
-        balanceResp = await axios.get(`${KASPA_REST}/addresses/${senderAddress}/balance`    );
-      } catch (err) {
-        balanceResp = { data: { balance: null } };
-      }
-
-      res.json({
-        status: "OK",
-        transactionId: txResponse.transactionId,
-        rawTransaction: txResponse.rawTransaction,
-        transferredAmount: amountToSend.toString(),
-        chargedAmount: (amountToSend + feeAmount).toString(),
-        walletBalance: balanceResp.data.balance,
-      });
-    } catch (err) {
-      console.error(err.response?.data || err.message);
-      res
-        .status(500)
-        .json({
-          error: "Transaction creation failed",
-          details: err.response?.data || err.message,
-        });
+      }));
     }
+
+    // Sign all inputs
+    const signedInputs = tx.inputs.map((input, index) => {
+      const inputSignature = input.getSignatures(
+        tx,
+        sk,
+        index,
+        crypto.Signature.SIGHASH_ALL,
+        null,
+        "schnorr"
+      )[0];
+      const signature = inputSignature.signature
+        .toBuffer("schnorr")
+        .toString("hex");
+
+      return {
+        previousOutpoint: {
+          transactionId: input.prevTxId.toString("hex"),
+          index: input.outputIndex,
+        },
+        signatureScript: `41${signature}01`,
+        sequence: input.sequenceNumber,
+        sigOpCount: 1,
+      };
+    });
+
+    // Prepare REST JSON
+    const restApiJson = {
+      transaction: {
+        version: tx.version,
+        inputs: signedInputs,
+        outputs: tx.outputs.map(o => ({
+          amount: o.satoshis,
+          scriptPublicKey: {
+            version: 0,
+            scriptPublicKey: o.script.toBuffer().toString("hex"),
+          },
+        })),
+        lockTime: 0,
+        subnetworkId: "0000000000000000000000000000000000000000",
+      },
+      allowOrphan: true,
+    };
+
+    // Broadcast transaction
+    const { data: txResponse } = await axios.post(
+      "https://api.kaspa.org/transactions",
+      restApiJson
+    );
+
+    // Fetch sender balance
+    let balanceResp;
+    try {
+      balanceResp = await axios.get(`${KASPA_REST}/addresses/${senderAddress}/balance`);
+    } catch (err) {
+      balanceResp = { data: { balance: null } };
+    }
+
+    res.json({
+      status: "OK",
+      transactionId: txResponse.transactionId,
+      rawTransaction: txResponse.rawTransaction,
+      transferredAmount: amountToSend.toString(),
+      chargedAmount: totalNeeded.toString(),
+      walletBalance: balanceResp.data.balance,
+    });
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({
+      error: "Transaction creation failed",
+      details: err.response?.data || err.message,
+    });
+  }
 });
+
 
 // ===== Transactions by Address (History) =====
 app.get("/transactions/:address", async (req, res) => {
@@ -359,7 +355,7 @@ app.get("/history/:address", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8081;
 app.listen(PORT, () => {
   console.log(`Kaspa API listening on port ${PORT}`);
 });
